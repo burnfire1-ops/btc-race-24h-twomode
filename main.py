@@ -320,15 +320,23 @@ class Ind15b(Ind15):
 def c2_rsi_entry(ind, m15, b, ctx):
     """DEV mode: C2 pullback (backtest_spike.c2_ema_pullback) + RSI(14) < 45
     filter. Returns the stop price (decision close * 0.98) or None."""
-    e20 = m15["ema20"]
-    r, rp = m15["rsi"], m15["rsi_prev"]
-    if e20 is None or r is None or rp is None:
+    ema20 = m15["ema20"]
+    rsi_now = m15["rsi"]
+    rsi_before = m15["rsi_prev"]
+    if ema20 is None:
         return None
-    touched = b["c"] >= e20 and b["c"] <= e20 * 1.005
+    if rsi_now is None or rsi_before is None:
+        return None
+    close = b["c"]
+    touches = close >= ema20 and close <= ema20 * 1.005
+    if not touches:
+        return None
     # C2 band [40, 55] rising, narrowed by the early-recovery filter r < 45.
-    if touched and C2_RSI_LO <= r < C2_RSI_FILTER and r > rp:
-        return b["c"] * (1 - C2_SL_PCT)
-    return None
+    if rsi_now < C2_RSI_LO or rsi_now >= C2_RSI_FILTER:
+        return None
+    if rsi_now <= rsi_before:
+        return None
+    return close * (1 - C2_SL_PCT)
 
 
 def make_e3(min_legs=1, stop_pct=0.005, stop_atr=1.5, rsi_mode="rsi2",
@@ -336,34 +344,40 @@ def make_e3(min_legs=1, stop_pct=0.005, stop_atr=1.5, rsi_mode="rsi2",
     """OR-union with tunable confluence (min legs) and stop width.
     min_legs=1, stop 0.5%/1.5xATR reproduces the original e3_or."""
     def e3(ind, m15, b, ctx):
-        bb = m15["bb"]
-        r2 = m15["rsi2"]
-        n = 0
-        if bb is not None and b["c"] < bb[2]:
-            n += 1
+        band = m15["bb"]
+        rsi2 = m15["rsi2"]
+        close = b["c"]
+        legs = 0
+        if band is not None and close < band[2]:
+            legs += 1
         if rsi_mode == "rsi14":
-            r14 = m15["rsi"]  # Ind15.rsi is RSI(14)
-            if r14 is not None and r14 < 30:
-                n += 1
-        elif r2 is not None and r2 < 10:
-            n += 1
-        if m15["ema20"] is not None and ind.atr.value:
-            z = (b["c"] - m15["ema20"]) / ind.atr.value
-            if z < -2.0:
-                n += 1
-        if m15["ema20"] is not None and ctx["trend"]:
-            cl = ind.closes
-            if len(cl) >= 2 and cl[-2] <= m15["ema20"] and cl[-1] > m15["ema20"]:
-                n += 1
-        if n >= min_legs:
-            atr = ind.atr.value
-            if pure_atr and atr:
-                return b["c"] - 2.0 * atr
-            stop = b["c"] * (1 - stop_pct)
-            if atr:
-                stop = min(stop, b["c"] - stop_atr * atr)
-            return stop
-        return None
+            rsi14 = m15["rsi"]  # Ind15.rsi is RSI(14)
+            if rsi14 is not None and rsi14 < 30:
+                legs += 1
+        elif rsi2 is not None and rsi2 < 10:
+            legs += 1
+        ema20 = m15["ema20"]
+        atr_val = ind.atr.value
+        if ema20 is not None and atr_val:
+            zscore = (close - ema20) / atr_val
+            if zscore < -2.0:
+                legs += 1
+        if ema20 is not None and ctx["trend"]:
+            closes = ind.closes
+            crossed = (len(closes) >= 2 and closes[-2] <= ema20
+                       and closes[-1] > ema20)
+            if crossed:
+                legs += 1
+        if legs < min_legs:
+            return None
+        if pure_atr and atr_val:
+            return close - 2.0 * atr_val
+        stop = close * (1 - stop_pct)
+        if atr_val:
+            alt = close - stop_atr * atr_val
+            if alt < stop:
+                stop = alt
+        return stop
     return e3
 
 
@@ -376,38 +390,47 @@ def make_e4(flush_bps=75, gate="none", sl_pct=0.01, trend_gate=False):
     Stop = entry * (1 - sl_pct)."""
     def e4(ind, m15, b, ctx):
         sma90 = ctx.get("sma90_1m")
+        close = b["c"]
         if sma90 is None:
             return None
-        if b["c"] >= sma90 * (1 - flush_bps / 10000.0):
+        flushed = close < sma90 * (1 - flush_bps / 10000.0)
+        if not flushed:
             return None
         if trend_gate and not ctx.get("trend"):
             return None
         if gate == "bounce":
             bars = ind.bars15
-            if len(bars) < 1 or bars[-1][3] <= bars[-1][0]:
+            if len(bars) < 1:
+                return None
+            last = bars[-1]
+            if last[3] <= last[0]:
                 return None
         elif gate == "rsi2":
-            r2 = m15["rsi2"]
-            if r2 is None or r2 >= 20:
+            rsi2 = m15["rsi2"]
+            if rsi2 is None or rsi2 >= 20:
                 return None
-        return b["c"] * (1 - sl_pct)
+        return close * (1 - sl_pct)
     return e4
 
 
 def make_combo_flat(atr_thr_bps=20.0):
     """Identical to run_combo_flat.make_combo_flat: I2c first, then #3c-flat
     only when ATR(14,15m) < 20 bps. Returns the stop price (float) or None."""
-    e_i2c = make_e4(75, "rsi2", 0.01)
-    e_3c = make_e3(2, 0.005, 1.5, "rsi2", False)
+    entry_i2c = make_e4(75, "rsi2", 0.01)
+    entry_3c = make_e3(2, 0.005, 1.5, "rsi2", False)
 
     def combo(ind, m15, b, ctx):
-        s = e_i2c(ind, m15, b, ctx)
-        if s is not None:
-            return s
-        atr = ind.atr.value
-        if atr is not None and atr / b["c"] * 10000 < atr_thr_bps:
-            return e_3c(ind, m15, b, ctx)
-        return None
+        stop = entry_i2c(ind, m15, b, ctx)
+        if stop is not None:
+            return stop
+        atr_val = ind.atr.value
+        close = b["c"]
+        if atr_val is None:
+            return None
+        atr_bps = atr_val / close * 10000
+        if atr_bps >= atr_thr_bps:
+            return None
+        return entry_3c(ind, m15, b, ctx)
 
     return combo
 
@@ -589,51 +612,53 @@ class Bot:
 
     def _decide_dev(self, state, m15, c_usd, h_usd, ctx):
         """C2-RSI: all-in entry, TP 1.5% / SL 2% / Chandelier trail / time 480."""
-        holding = self.qty_btc > 0
-        if holding:
-            self.highest = max(self.highest, h_usd)
+        has_pos = self.qty_btc > 0
+        if has_pos:
+            if h_usd > self.highest:
+                self.highest = h_usd
             # exits, in order: TP, SL, trail (Chandelier 2*ATR), time
-            reason = None
-            if c_usd >= self.entry_px * (1 + C2_TP_PCT):
-                reason = "tp"
+            why = None
+            tp_px = self.entry_px * (1 + C2_TP_PCT)
+            if c_usd >= tp_px:
+                why = "tp"
             elif c_usd <= self.stop_px:
-                reason = "sl"
+                why = "sl"
             else:
-                atr = self.ind.atr.value
-                trail = (self.highest - C2_TRAIL_ATR_MULT * atr
-                         if atr is not None else None)
-                if trail is not None and c_usd <= trail:
-                    reason = "trail"
-                elif state.seq - self.entry_seq >= C2_TIME_STOP_BARS:
-                    reason = "time"
-            if reason is not None:
-                held = state.positions.get(SYMBOL)
-                if held is None or held.qty <= 0:
-                    return []
-                cid = self._next_id("s") + "-" + reason
-                self.pending = {"side": "sell", "client_id": cid,
-                                "notional_raw": 0, "dec_close": c_usd}
-                sys.stderr.write("exit %s seq=%d\n" % (reason, state.seq))
-                return [{"side": "sell", "symbol": SYMBOL, "client_id": cid,
-                         "qty": held.qty, "max_slippage_bps": MAX_SLIP_BPS}]
-            return []
+                atr_now = self.ind.atr.value
+                if atr_now is not None:
+                    trail_px = self.highest - C2_TRAIL_ATR_MULT * atr_now
+                    if c_usd <= trail_px:
+                        why = "trail"
+                if why is None and state.seq - self.entry_seq >= C2_TIME_STOP_BARS:
+                    why = "time"
+            if why is None:
+                return []
+            pos = state.positions.get(SYMBOL)
+            if pos is None or pos.qty <= 0:
+                return []
+            oid = self._next_id("s") + "-" + why
+            self.pending = {"side": "sell", "client_id": oid,
+                            "notional_raw": 0, "dec_close": c_usd}
+            sys.stderr.write("exit %s seq=%d\n" % (why, state.seq))
+            return [{"side": "sell", "symbol": SYMBOL, "client_id": oid,
+                     "qty": pos.qty, "max_slippage_bps": MAX_SLIP_BPS}]
         # flat: entry only when not warming up and a 15m bar just completed
         if state.warming_up or m15 is None:
             return []
-        b = {"c": c_usd}
-        sig = c2_rsi_entry(self.ind, m15, b, ctx)
-        if sig is not None and isinstance(sig, float):
-            if state.cash <= 0:
-                return []
-            cid = self._next_id("b")
-            self.pending = {"side": "buy", "client_id": cid,
-                            "notional_raw": state.cash,
-                            "dec_close": c_usd}
-            self.pending_stop = sig
-            return [{"side": "buy", "symbol": SYMBOL, "client_id": cid,
-                     "notional_quote_units": state.cash,
-                     "max_slippage_bps": MAX_SLIP_BPS}]
-        return []
+        bar1m = {"c": c_usd}
+        stop_px = c2_rsi_entry(self.ind, m15, bar1m, ctx)
+        if stop_px is None or not isinstance(stop_px, float):
+            return []
+        if state.cash <= 0:
+            return []
+        oid = self._next_id("b")
+        self.pending = {"side": "buy", "client_id": oid,
+                        "notional_raw": state.cash,
+                        "dec_close": c_usd}
+        self.pending_stop = stop_px
+        return [{"side": "buy", "symbol": SYMBOL, "client_id": oid,
+                 "notional_quote_units": state.cash,
+                 "max_slippage_bps": MAX_SLIP_BPS}]
 
     def _decide_race(self, state, m15, c_usd, h_usd, ctx):
         """ACCUM-A strict: $250/tranche entry + accumulation, TP 3% / SL /
